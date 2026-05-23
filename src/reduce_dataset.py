@@ -226,46 +226,124 @@ def _range_get(url: str, start: int, end: int) -> bytes:
 
 
 def _find_eocd(url: str, file_size: int) -> dict:
-    """Locate and parse the End-Of-Central-Directory record."""
+    """Locate and parse the End-Of-Central-Directory record.
+
+    Handles both standard ZIP and ZIP64 (EOCD64 locator + EOCD64).
+    """
     search_start = max(0, file_size - _EOCD_SEARCH_SIZE)
     tail = _range_get(url, search_start, file_size - 1)
+    tail_offset = search_start  # byte offset of tail[0] in the file
 
-    # Search for EOCD signature from the end
+    # ---- Try ZIP64 first (EOCD64 locator signature PK\x06\x07) ----
+    ZIP64_LOCATOR_SIG = b"PK\x06\x07"
+    ZIP64_EOCD_SIG    = b"PK\x06\x06"
+
+    loc_pos = tail.rfind(ZIP64_LOCATOR_SIG)
+    if loc_pos != -1:
+        # Locator is 20 bytes: sig(4) + disk_with_eocd64(4) + eocd64_offset(8) + total_disks(4)
+        eocd64_offset = struct.unpack_from("<Q", tail, loc_pos + 8)[0]
+        eocd64_raw = _range_get(url, eocd64_offset, eocd64_offset + 55)
+        if eocd64_raw[:4] == ZIP64_EOCD_SIG:
+            # EOCD64: sig(4) + size_of_eocd64(8) + ... + cd_size(8) + cd_offset(8)
+            cd_size   = struct.unpack_from("<Q", eocd64_raw, 40)[0]
+            cd_offset = struct.unpack_from("<Q", eocd64_raw, 48)[0]
+            print(f"  [zip64] EOCD64 found — CD offset={cd_offset}, size={cd_size}")
+            return {"cd_offset": cd_offset, "cd_size": cd_size}
+
+    # ---- Fallback: standard EOCD ----
     pos = tail.rfind(_EOCD_SIGNATURE)
     if pos == -1:
         raise RuntimeError("EOCD signature not found — is this a valid ZIP?")
 
-    eocd = tail[pos:]
-    (_, disk_cd, cd_size, cd_offset, comment_len) = struct.unpack_from("<HHIIH", eocd, 4)
+    # Standard EOCD layout (after the 4-byte signature):
+    # disk_number(2) + disk_with_cd(2) + entries_on_disk(2) + total_entries(2)
+    # + cd_size(4) + cd_offset(4) + comment_len(2)
+    cd_size, cd_offset = struct.unpack_from("<II", tail, pos + 12)
+
+    # If values are 0xFFFFFFFF it's ZIP64 but the locator wasn't found — warn.
+    if cd_offset == 0xFFFFFFFF or cd_size == 0xFFFFFFFF:
+        raise RuntimeError(
+            "ZIP64 markers found in EOCD but ZIP64 locator/EOCD64 not detected. "
+            "The remote server may not support range requests on this file."
+        )
+
     return {"cd_offset": cd_offset, "cd_size": cd_size}
 
 
 def _parse_central_directory(url: str, cd_offset: int, cd_size: int) -> list[dict]:
-    """Parse the Central Directory and return a list of entry dicts."""
-    cd_data = _range_get(url, cd_offset, cd_offset + cd_size - 1)
+    """Parse the Central Directory and return a list of entry dicts.
+
+    Fetches the CD in chunks of 8 MB to handle large directories (>100 MB).
+    """
+    CHUNK = 8 * 1024 * 1024  # 8 MB per request
+    cd_data = b""
+    fetched = 0
+    while fetched < cd_size:
+        chunk_start = cd_offset + fetched
+        chunk_end   = min(cd_offset + cd_size - 1, chunk_start + CHUNK - 1)
+        cd_data += _range_get(url, chunk_start, chunk_end)
+        fetched += chunk_end - chunk_start + 1
+        print(f"  [zip] CD fetched: {fetched / 1024**2:.1f} / {cd_size / 1024**2:.1f} MB …",
+              end="\r", flush=True)
+    print()
+
     entries = []
     pos = 0
-    while pos < len(cd_data):
+    while pos + 46 <= len(cd_data):
         if cd_data[pos:pos + 4] != _CD_SIGNATURE:
             break
+
+        # Central directory entry fixed fields (after 4-byte sig):
+        # version_made(2) version_needed(2) flags(2) compression(2)
+        # mod_time(2) mod_date(2) crc32(4)
+        # compressed_size(4) uncompressed_size(4)
+        # fname_len(2) extra_len(2) comment_len(2)
+        # disk_start(2) int_attr(2) ext_attr(4) lh_offset(4)
         (
-            _version_made, _version_needed, _flags, _compression,
-            _mod_time, _mod_date, _crc32,
+            _vm, _vn, _flags, _comp,
+            _mt, _md, _crc,
             compressed_size, uncompressed_size,
             fname_len, extra_len, comment_len,
-            _disk_start, _int_attr, _ext_attr,
+            _disk, _iattr, _eattr,
             local_header_offset,
         ) = struct.unpack_from("<HHHHHHIIIHHHHHII", cd_data, pos + 4)
 
         fname_start = pos + 46
-        fname = cd_data[fname_start: fname_start + fname_len].decode("utf-8", errors="replace")
+        fname_end   = fname_start + fname_len
+        fname = cd_data[fname_start:fname_end].decode("utf-8", errors="replace")
+
+        # Handle ZIP64 extra field (values 0xFFFF / 0xFFFFFFFF mean "see ZIP64 extra")
+        extra_data = cd_data[fname_end: fname_end + extra_len]
+        if compressed_size == 0xFFFFFFFF or uncompressed_size == 0xFFFFFFFF \
+                or local_header_offset == 0xFFFFFFFF:
+            # Parse ZIP64 extended info extra field (tag 0x0001)
+            ep = 0
+            while ep + 4 <= len(extra_data):
+                tag, size = struct.unpack_from("<HH", extra_data, ep)
+                ep += 4
+                if tag == 0x0001:
+                    vals = []
+                    vp = ep
+                    while vp + 8 <= ep + size:
+                        vals.append(struct.unpack_from("<Q", extra_data, vp)[0])
+                        vp += 8
+                    vi = 0
+                    if uncompressed_size == 0xFFFFFFFF and vi < len(vals):
+                        uncompressed_size = vals[vi]; vi += 1
+                    if compressed_size == 0xFFFFFFFF and vi < len(vals):
+                        compressed_size = vals[vi]; vi += 1
+                    if local_header_offset == 0xFFFFFFFF and vi < len(vals):
+                        local_header_offset = vals[vi]; vi += 1
+                    break
+                ep += size
+
         entries.append({
             "name": fname,
             "compressed_size": compressed_size,
             "uncompressed_size": uncompressed_size,
             "local_header_offset": local_header_offset,
         })
-        pos = fname_start + fname_len + extra_len + comment_len
+        pos = fname_end + extra_len + comment_len
 
     return entries
 
@@ -471,17 +549,24 @@ def run(
     record = fetch_zenodo_record()
     files = list_zenodo_files(record)
 
-    large_zips = [
-        f for f in files
-        if f["name"].endswith(".zip") and f["size_bytes"] > 1 * 1024 ** 3
-    ]
-    if not large_zips:
-        raise RuntimeError(
-            "No large ZIP found in Zenodo record. "
-            f"Files: {[f['name'] for f in files]}"
-        )
+    # Target the FDK CT reconstructions ZIP specifically
+    ct_zip_name = "CT_fdk_reconstructions.zip"
+    ct_zips = [f for f in files if f["name"] == ct_zip_name]
+    if not ct_zips:
+        # Fallback: largest ZIP in the record
+        large_zips = [
+            f for f in files
+            if f["name"].endswith(".zip") and f["size_bytes"] > 1 * 1024 ** 3
+        ]
+        if not large_zips:
+            raise RuntimeError(
+                "No CT ZIP found in Zenodo record. "
+                f"Files: {[f['name'] for f in files]}"
+            )
+        ct_zips = sorted(large_zips, key=lambda x: x["size_bytes"], reverse=True)
+        print(f"  [warn] '{ct_zip_name}' not found, using largest ZIP instead: {ct_zips[0]['name']}")
 
-    zip_file = large_zips[0]
+    zip_file = ct_zips[0]
     zip_url = zip_file["url"]
     print(f"[zip] Target: {zip_file['name']}  ({_fmt_size(zip_file['size_bytes'])})")
 

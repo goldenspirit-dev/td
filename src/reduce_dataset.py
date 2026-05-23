@@ -462,16 +462,58 @@ def match_apple_entries(
     entries: list[dict],
     apple_ids: list[str],
 ) -> dict[str, list[dict]]:
-    """Match apple IDs to ZIP entries (one apple may span multiple files)."""
+    """Match apple IDs to ZIP entries.
+
+    The CT ZIP contains one folder per apple with TIFF slices, e.g.:
+        CT_fdk_reconstructions/1/output00072_0001.tif  <- apple 72, slice 1
+        CT_fdk_reconstructions/1/output00072_0002.tif  <- apple 72, slice 2
+
+    We match on the zero-padded apple ID (e.g. '00072' for apple 72).
+    """
     matched: dict[str, list[dict]] = {aid: [] for aid in apple_ids}
     for e in entries:
+        if e["uncompressed_size"] == 0:
+            continue  # skip directory entries
+        if not e["name"].lower().endswith((".tif", ".tiff")):
+            continue  # only TIFF slices
         for aid in apple_ids:
-            if str(aid) in e["name"]:
+            padded = str(aid).zfill(5)
+            if padded in e["name"]:
                 matched[aid].append(e)
+                break
+
+    # Sort slices by filename so Z-order is correct
+    for aid in apple_ids:
+        matched[aid].sort(key=lambda e: e["name"])
+
     missing = [aid for aid, v in matched.items() if not v]
     if missing:
         print(f"  [warn] No ZIP entries found for apple IDs: {missing}")
+
+    for aid, ents in matched.items():
+        if ents:
+            print(f"  apple {aid}: {len(ents)} slices matched")
+
     return matched
+
+
+def _read_tiff_from_bytes(data: bytes) -> np.ndarray:
+    """Decode a TIFF file from raw bytes into a 2D numpy array."""
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        return np.array(img, dtype=np.float32)
+    except ImportError:
+        pass
+    try:
+        import tifffile
+        return tifffile.imread(io.BytesIO(data)).astype(np.float32)
+    except ImportError:
+        pass
+    raise ImportError(
+        "Cannot decode TIFF: install Pillow or tifffile.\n"
+        "  pip install Pillow"
+    )
 
 
 def process_apple(
@@ -482,36 +524,41 @@ def process_apple(
     out_dir: Path,
     dry_run: bool = False,
 ) -> Optional[dict]:
-    """Download, sub-sample, and save one apple. Returns manifest row."""
+    """Download, sub-sample, and save one apple. Returns manifest row.
+
+    Each apple is a stack of 2D TIFF slices. We download every slice_step-th
+    slice, decode, stack into (Z, Y, X), normalise to float32 [0,1], save .npz.
+    """
     dest = out_dir / f"apple_{apple_id}.npz"
     if dest.exists():
         print(f"  [skip] apple_{apple_id}.npz already exists")
         size = dest.stat().st_size
         return {"apple_id": apple_id, "file": dest.name, "size_bytes": size}
 
-    if dry_run:
-        total = sum(e["compressed_size"] for e in entries)
-        print(f"  [dry-run] apple {apple_id}: {len(entries)} file(s), "
-              f"~{_fmt_size(total)} compressed")
-        return None
-
     if not entries:
         print(f"  [skip] apple {apple_id}: no matching ZIP entries found")
         return None
 
-    # Download & decode each file for this apple
-    volumes = []
-    for entry in entries:
-        print(f"    Fetching {entry['name']} ({_fmt_size(entry['compressed_size'])}) …")
+    selected_entries = entries[::slice_step]
+
+    if dry_run:
+        total = sum(e["compressed_size"] for e in selected_entries)
+        print(f"  [dry-run] apple {apple_id}: {len(entries)} slices total -> "
+              f"{len(selected_entries)} kept (step={slice_step}), "
+              f"~{_fmt_size(total)} to download")
+        return None
+
+    slices = []
+    for i, entry in enumerate(selected_entries):
+        print(f"    [{i+1}/{len(selected_entries)}] {entry['name'].split('/')[-1]} "
+              f"({_fmt_size(entry['compressed_size'])}) ...", end=" ", flush=True)
         raw = _download_zip_entry(zip_url, entry)
-        vol = _parse_volume_from_bytes(raw, apple_id)
-        volumes.append(vol)
+        arr = _read_tiff_from_bytes(raw)
+        slices.append(arr)
+        print(f"shape={arr.shape}")
 
-    # Combine slabs if multi-file
-    vol = volumes[0] if len(volumes) == 1 else np.concatenate(volumes, axis=0)
-
+    vol = np.stack(slices, axis=0)   # (Z, Y, X)
     vol = normalize_volume(vol)
-    vol = subsample_slices(vol, slice_step)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(str(dest), volume=vol)

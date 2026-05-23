@@ -32,6 +32,7 @@ import io
 import json
 import struct
 import sys
+import time
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -216,13 +217,24 @@ _LF_SIGNATURE = b"PK\x03\x04"
 _EOCD_SEARCH_SIZE = 65536 + 22
 
 
-def _range_get(url: str, start: int, end: int) -> bytes:
-    """HTTP GET with Range header. *end* is inclusive."""
+def _range_get(url: str, start: int, end: int, *, retries: int = 6) -> bytes:
+    """HTTP GET with Range header, with exponential backoff on 429/5xx."""
     headers = {"Range": f"bytes={start}-{end}"}
-    r = requests.get(url, headers=headers, timeout=60)
-    if r.status_code not in (200, 206):
-        raise RuntimeError(f"Range request failed: {r.status_code} for {url}")
-    return r.content
+    for attempt in range(retries):
+        r = requests.get(url, headers=headers, timeout=120)
+        if r.status_code in (200, 206):
+            return r.content
+        if r.status_code == 429:
+            wait = 2 ** attempt * 5  # 5, 10, 20, 40, 80, 160s
+            print(f"\n  [rate-limit] 429 — waiting {wait}s before retry {attempt+1}/{retries} …")
+            time.sleep(wait)
+        elif r.status_code >= 500:
+            wait = 2 ** attempt * 3
+            print(f"\n  [server error] {r.status_code} — waiting {wait}s …")
+            time.sleep(wait)
+        else:
+            raise RuntimeError(f"Range request failed: {r.status_code} for {url}")
+    raise RuntimeError(f"Range request failed after {retries} retries (last status: {r.status_code})")
 
 
 def _find_eocd(url: str, file_size: int) -> dict:
@@ -556,6 +568,7 @@ def process_apple(
         arr = _read_tiff_from_bytes(raw)
         slices.append(arr)
         print(f"shape={arr.shape}")
+        time.sleep(0.3)  # be polite to Zenodo
 
     # Slices may have different shapes (each is cropped around the apple).
     # Pad all to the max (H, W) so np.stack works.

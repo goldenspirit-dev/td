@@ -1,0 +1,15 @@
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+
+preprocessing:
+  target_spacing: [1.0, 1.0, 1.0]
+  intensity_clip: [-1000, 1000]
+
+filtration:
+  type: cubical_sublevel
+  homology_dims: [0, 1, 2]
+
+vectorization:
+  method: persistence_image
+  resolution: [20, 20]

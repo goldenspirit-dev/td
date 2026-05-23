@@ -1,0 +1,57 @@
+# Data — never track raw/interim/processed volumetric data
+data/raw/
+data/interim/
+data/processed/
+data/synthetic/
+*.nii
+*.nii.gz
+*.mhd
+*.raw
+*.nrrd
+*.h5
+*.hdf5
+*.tif
+*.tiff
+*.npy
+*.npz
+
+# Models & large outputs
+models/*
+!models/.gitkeep
+results/figures/*.png
+results/figures/*.pdf
+!results/figures/.gitkeep
+*.pkl
+*.joblib
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

@@ -557,7 +557,16 @@ def process_apple(
         slices.append(arr)
         print(f"shape={arr.shape}")
 
-    vol = np.stack(slices, axis=0)   # (Z, Y, X)
+    # Slices may have different shapes (each is cropped around the apple).
+    # Pad all to the max (H, W) so np.stack works.
+    max_h = max(s.shape[0] for s in slices)
+    max_w = max(s.shape[1] for s in slices)
+    padded = []
+    for s in slices:
+        ph = max_h - s.shape[0]
+        pw = max_w - s.shape[1]
+        padded.append(np.pad(s, ((0, ph), (0, pw)), mode="constant", constant_values=0))
+    vol = np.stack(padded, axis=0)   # (Z, Y, X)
     vol = normalize_volume(vol)
 
     out_dir.mkdir(parents=True, exist_ok=True)
